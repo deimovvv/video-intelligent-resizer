@@ -1,0 +1,9 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+aiohttp==3.12.15
+numpy==2.2.6
+opencv-python-headless==4.12.0.88
+mediapipe==0.10.14
+ultralytics==8.3.189
+pydantic==2.11.3
+typing-extensions==4.12.2

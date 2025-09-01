@@ -1,0 +1,31 @@
+# Imagen base
+FROM python:3.11-slim
+
+# Paquetes del sistema (ffmpeg)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+# Carpeta de trabajo
+WORKDIR /app
+
+# Torch CPU primero (más robusto para evitar timeouts; usa índice oficial CPU)
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+    torch==2.3.1+cpu torchvision==0.18.1+cpu
+
+# Requisitos de la API (resto de deps)
+COPY requirements_api_full.txt .
+RUN pip install --no-cache-dir -r requirements_api_full.txt
+
+# Código de la app
+COPY . .
+
+# Variables de entorno para FastAPI/Uvicorn
+ENV PYTHONUNBUFFERED=1 \
+    UVICORN_WORKERS=1
+
+# Puerto de la API
+EXPOSE 8000
+
+# Comando por defecto
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

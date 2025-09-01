@@ -1,0 +1,33 @@
+# --- Python / FastAPI
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# --- Node / Next.js
+node_modules/
+web/.next/
+web/.vercel/
+web/.turbo/
+web/.cache/
+web/.DS_Store
+
+# --- Datos/artefactos
+runs/
+input/
+output/
+*.zip
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.m4v
+
+# --- OS
+.DS_Store
+Thumbs.db
+
+# --- VS Code
+.vscode/
