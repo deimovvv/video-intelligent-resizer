@@ -1,0 +1,22 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.full   # 👈 acá le decís que use el Dockerfile.full
+    container_name: videoresizer-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./runs:/app/runs
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: videoresizer-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped

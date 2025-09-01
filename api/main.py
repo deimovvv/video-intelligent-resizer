@@ -7,17 +7,20 @@ from pathlib import Path
 from typing import List, Dict, Any
 import subprocess
 import requests
+import re
+import mimetypes
+from urllib.parse import urlparse, unquote, parse_qs
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-# --- import del reframe YOLO (tu archivo en scripts/) ---
+# --- import del reframe YOLO (archivo en scripts/) ---
 import sys as _sys
 BASE_DIR = Path(__file__).resolve().parents[1]
 _sys.path.insert(0, str(BASE_DIR / "scripts"))
 try:
-    # reframe_video(src, dst, w, h, detect_every, ema_alpha, pan_cap_px, override, model_name, conf)
+    # yolo_reframe(src, dst, w, h, detect_every, ema_alpha, pan_cap_px, override, model_name, conf)
     from batch_reframe_track_yolo import reframe_video as yolo_reframe
 except Exception:
     yolo_reframe = None
@@ -37,24 +40,76 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 RUNS_DIR = BASE_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
-# -------------------- util nombres --------------------
-def _safe_name_from_url(url: str) -> str:
-    """
-    Toma el último segmento sin query. Si no hay extensión, asume mp4.
-    """
-    name = url.split("?")[0].rstrip("/").split("/")[-1] or "file"
-    if "." not in name:
-        name += ".mp4"
-    return name.replace("%20", "_")
+# -------------------- helpers de nombres/descarga --------------------
+_CONTENT_TYPE_EXT = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/mpeg": ".mpg",
+}
+_INVALID_WIN_CHARS = r'<>:"/\|?*\0'
+
+def _sanitize_filename(name: str) -> str:
+    name = "".join(c for c in name if c not in _INVALID_WIN_CHARS).strip()
+    if not name or name.upper() in {
+        "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+    }:
+        name = "file"
+    return name
+
+def _ext_from_content_type(ct: str | None) -> str:
+    if not ct:
+        return ".mp4"
+    ct = ct.split(";")[0].strip().lower()
+    return _CONTENT_TYPE_EXT.get(ct) or (mimetypes.guess_extension(ct) or ".mp4")
+
+def _filename_from_content_disposition(cd: str | None) -> str | None:
+    if not cd:
+        return None
+    m = re.search(r"filename\*\s*=\s*[^']+''([^;]+)", cd, flags=re.I)
+    if m:
+        return unquote(m.group(1))
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, flags=re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r'filename\s*=\s*([^;]+)', cd, flags=re.I)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def _candidate_from_query(url: str) -> str | None:
+    q = parse_qs(urlparse(url).query)
+    for key in ("filename", "fileName", "name", "title", "attachment", "attname"):
+        if key in q and q[key]:
+            return q[key][0]
+    return None
+
+def _derive_name(url: str, headers: Dict[str, str]) -> str:
+    cd = headers.get("content-disposition") or headers.get("Content-Disposition")
+    name = _filename_from_content_disposition(cd)
+
+    if not name:
+        name = _candidate_from_query(url)
+
+    if not name:
+        path_last = urlparse(url).path.rstrip("/").split("/")[-1] or "file"
+        name = unquote(path_last)
+
+    name = _sanitize_filename(name)
+
+    # añade extensión si falta
+    has_ext = "." in Path(name).name and len(Path(name).suffix) > 1
+    if not has_ext:
+        ext = _ext_from_content_type(headers.get("content-type") or headers.get("Content-Type"))
+        name = f"{name}{ext}"
+    return name
 
 def _dedup_path(p: Path) -> Path:
-    """
-    Si p existe, devuelve p con sufijos _2, _3, ...
-    """
     if not p.exists():
         return p
-    stem = p.stem
-    suf = p.suffix
+    stem, suf = p.stem, p.suffix
     i = 2
     while True:
         cand = p.with_name(f"{stem}_{i}{suf}")
@@ -67,10 +122,10 @@ def download_many(urls: List[str], dest_dir: Path) -> List[Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     out: List[Path] = []
     for u in urls:
-        name = _safe_name_from_url(u)
-        out_path = _dedup_path(dest_dir / name)
         with requests.get(u, stream=True, timeout=60) as r:
             r.raise_for_status()
+            name = _derive_name(u, r.headers)
+            out_path = _dedup_path(dest_dir / name)
             with open(out_path, "wb") as f:
                 for chunk in r.iter_content(1024 * 256):
                     if chunk:
@@ -153,7 +208,7 @@ def _process_job(job_id: str):
                     if yolo_reframe is None:
                         raise RuntimeError("YOLO no disponible (import failed).")
                     W, H = targets.get(r, (1080, 1920))
-                    out_name = f"{stem}_{r}.mp4"  # tracked siempre mp4
+                    out_name = f"{stem}_tracked_{r}.mp4"  # <-- sufijo explícito
                     out_path = subdir / out_name
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     yolo_reframe(

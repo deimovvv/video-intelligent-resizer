@@ -79,7 +79,7 @@ export default function Home() {
       try {
         const res = await fetch(`${API_BASE}/jobs/${jobId}`, { cache: 'no-store' });
         if (!res.ok) return;
-        const js = await res.json() as any;
+        const js = await res.json() as { phase: 'queued'|'downloading'|'processing'|'zipping'|'done'|'error'|'canceled'; message: string; progress?: number; total_steps?: number; step_index?: number; current_file?: string; current_ratio?: string; error?: string; };
         const status: JobStatus = {
           id: jobId,
           phase: js.phase, message: js.message,
@@ -112,7 +112,7 @@ export default function Home() {
     tick();
     pollRef.current = setInterval(tick, 1200);
     return () => clearPoll();
-  }, [jobId]);
+  }, [jobId, showToast]);
 
   // -------- Presets --------
   function applyPreset(kind:'fast'|'balanced'|'accurate') {
@@ -136,7 +136,7 @@ export default function Home() {
     setLoading(true); setJobId(null); setJob(null);
     showToast('info','Creando job y comenzando proceso…');
 
-    const body:any = { urls, ratios, codec, mode };
+    const body: { urls: string[]; ratios: Ratio[]; codec: string; mode: Mode; group_by_ratio: boolean; detect_every?: number; ema_alpha?: number; pan_cap_px?: number; yolo_model?: string; yolo_conf?: number; } = { urls, ratios, codec, mode, group_by_ratio: groupByRatio };
     if (mode === 'tracked_yolo') {
       body.detect_every = detectEvery;
       body.ema_alpha    = emaAlpha;
@@ -154,8 +154,8 @@ export default function Home() {
       const js = await res.json();
       setJobId(js.job_id);
       setJob(js.status);
-    } catch (err:any) {
-      showToast('error', `Error al crear job: ${err.message || err}`);
+    } catch (err: unknown) {
+      showToast('error', `Error al crear job: ${err instanceof Error ? err.message : String(err)}`);
       setLoading(false);
     } finally {
       setLoading(false);
@@ -168,8 +168,8 @@ export default function Home() {
       const res = await fetch(`${API_BASE}/jobs/${jobId}/cancel`, { method:'POST' });
       if (!res.ok) throw new Error(await res.text());
       showToast('info','Cancelando…');
-    } catch (e:any) {
-      showToast('error', `No se pudo cancelar: ${e.message || e}`);
+    } catch (e: unknown) {
+      showToast('error', `No se pudo cancelar: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -245,7 +245,7 @@ export default function Home() {
                     <div>
                       <FieldLabel label="Codec" hint="H.264 o ProRes (solo Resize)"/>
                       <select className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
-                              value={codec} onChange={(e)=>setCodec(e.target.value as any)} disabled={busy || mode==='tracked_yolo'}>
+                              value={codec} onChange={(e)=>setCodec(e.target.value as 'h264'|'prores')} disabled={busy || mode==='tracked_yolo'}>
                         <option value="h264">H.264 (MP4)</option>
                         <option value="prores">ProRes</option>
                       </select>
@@ -264,37 +264,61 @@ export default function Home() {
                     </div>
                   </div>
 
+                  {/* Carpeta por ratio */}
+                  <div className="flex items-center gap-3">
+                    <input id="gbr" type="checkbox" className="accent-indigo-500"
+                      checked={groupByRatio} onChange={e=>setGroupByRatio(e.target.checked)} disabled={busy}/>
+                    <label htmlFor="gbr" className="text-sm">Carpetas por ratio en el ZIP</label>
+                  </div>
+
+                  {/* Presets + knobs YOLO */}
                   {mode === 'tracked_yolo' && (
-                    <div className="border-t border-neutral-800 pt-4 grid grid-cols-1 md:grid-cols-5 gap-4">
-                      <div>
-                        <FieldLabel label="detect_every" hint="Frames entre redetecciones (↑ = más rápido)" />
-                        <input type="number" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
-                               value={detectEvery} min={1} onChange={e=>setDetectEvery(parseInt(e.target.value||'1',10))} disabled={busy}/>
+                    <>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <span className="text-sm text-neutral-400">Presets:</span>
+                        <button type="button"
+                          className={`text-xs rounded-lg px-3 py-1 ${activePreset==='fast'?'bg-indigo-600':'bg-neutral-800 hover:bg-neutral-700'}`}
+                          onClick={()=>applyPreset('fast')} disabled={busy}>Rápido</button>
+                        <button type="button"
+                          className={`text-xs rounded-lg px-3 py-1 ${activePreset==='balanced'?'bg-indigo-600':'bg-neutral-800 hover:bg-neutral-700'}`}
+                          onClick={()=>applyPreset('balanced')} disabled={busy}>Balanceado</button>
+                        <button type="button"
+                          className={`text-xs rounded-lg px-3 py-1 ${activePreset==='accurate'?'bg-indigo-600':'bg-neutral-800 hover:bg-neutral-700'}`}
+                          onClick={()=>applyPreset('accurate')} disabled={busy}>Preciso</button>
+                        {activePreset && <span className="text-xs text-neutral-500">({activePreset})</span>}
                       </div>
-                      <div>
-                        <FieldLabel label="ema_alpha" hint="Suavizado (0–1). Más bajo = más suave." />
-                        <input type="number" step="0.01" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
-                               value={emaAlpha} onChange={e=>setEmaAlpha(parseFloat(e.target.value||'0.08'))} disabled={busy}/>
+
+                      <div className="border-t border-neutral-800 pt-4 grid grid-cols-1 md:grid-cols-5 gap-4">
+                        <div>
+                          <FieldLabel label="detect_every" hint="Frames entre redetecciones (↑ = más rápido)" />
+                          <input type="number" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
+                                 value={detectEvery} min={1} onChange={e=>{setActivePreset(null); setDetectEvery(parseInt(e.target.value||'1',10));}} disabled={busy}/>
+                        </div>
+                        <div>
+                          <FieldLabel label="ema_alpha" hint="Suavizado (0–1). Más bajo = más suave." />
+                          <input type="number" step="0.01" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
+                                 value={emaAlpha} onChange={e=>{setActivePreset(null); setEmaAlpha(parseFloat(e.target.value||'0.08'));}} disabled={busy}/>
+                        </div>
+                        <div>
+                          <FieldLabel label="pan_cap_px" hint="Límite de paneo por frame (px)" />
+                          <input type="number" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
+                                 value={panCapPx} onChange={e=>{setActivePreset(null); setPanCapPx(parseInt(e.target.value||'16',10));}} disabled={busy}/>
+                        </div>
+                        <div>
+                          <FieldLabel label="yolo_model" hint="n = más rápido, s = más preciso" />
+                          <select className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
+                                  value={yoloModel} onChange={e=>{setActivePreset(null); setYoloModel(e.target.value as 'yolov8n.pt'|'yolov8s.pt');}} disabled={busy}>
+                            <option value="yolov8n.pt">yolov8n.pt</option>
+                            <option value="yolov8s.pt">yolov8s.pt</option>
+                          </select>
+                        </div>
+                        <div>
+                          <FieldLabel label="yolo_conf" hint="Umbral de confianza (0–1)" />
+                          <input type="number" step="0.01" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
+                                 value={yoloConf} onChange={e=>{setActivePreset(null); setYoloConf(parseFloat(e.target.value||'0.35'));}} disabled={busy}/>
+                        </div>
                       </div>
-                      <div>
-                        <FieldLabel label="pan_cap_px" hint="Límite de paneo por frame (px)" />
-                        <input type="number" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
-                               value={panCapPx} onChange={e=>setPanCapPx(parseInt(e.target.value||'16',10))} disabled={busy}/>
-                      </div>
-                      <div>
-                        <FieldLabel label="yolo_model" hint="n = más rápido, s = más preciso" />
-                        <select className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
-                                value={yoloModel} onChange={e=>setYoloModel(e.target.value as any)} disabled={busy}>
-                          <option value="yolov8n.pt">yolov8n.pt</option>
-                          <option value="yolov8s.pt">yolov8s.pt</option>
-                        </select>
-                      </div>
-                      <div>
-                        <FieldLabel label="yolo_conf" hint="Umbral de confianza (0–1)" />
-                        <input type="number" step="0.01" className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
-                               value={yoloConf} onChange={e=>setYoloConf(parseFloat(e.target.value||'0.35'))} disabled={busy}/>
-                      </div>
-                    </div>
+                    </>
                   )}
                 </div>
               </section>
