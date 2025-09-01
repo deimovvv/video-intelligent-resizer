@@ -36,6 +36,11 @@ export default function Home() {
   const [panCapPx, setPanCapPx] = useState(16);
   const [yoloModel, setYoloModel] = useState<'yolov8n.pt'|'yolov8s.pt'>('yolov8n.pt');
   const [yoloConf, setYoloConf] = useState(0.35);
+  const [activePreset, setActivePreset] =
+    useState<'fast'|'balanced'|'accurate'|null>(null);
+
+  // agrupado por ratio
+  const [groupByRatio, setGroupByRatio] = useState(true);
 
   const [jobId, setJobId] = useState<string | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
@@ -108,6 +113,21 @@ export default function Home() {
     pollRef.current = setInterval(tick, 1200);
     return () => clearPoll();
   }, [jobId]);
+
+  // -------- Presets --------
+  function applyPreset(kind:'fast'|'balanced'|'accurate') {
+    if (kind === 'fast') {
+      setDetectEvery(18); setEmaAlpha(0.07); setPanCapPx(20);
+      setYoloModel('yolov8n.pt'); setYoloConf(0.35);
+    } else if (kind === 'balanced') {
+      setDetectEvery(12); setEmaAlpha(0.08); setPanCapPx(16);
+      setYoloModel('yolov8n.pt'); setYoloConf(0.40);
+    } else {
+      setDetectEvery(8); setEmaAlpha(0.06); setPanCapPx(12);
+      setYoloModel('yolov8s.pt'); setYoloConf(0.45);
+    }
+    setActivePreset(kind);
+  }
 
   async function handleSubmit(e?: React.FormEvent) {
     e?.preventDefault();

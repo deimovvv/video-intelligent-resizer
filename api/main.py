@@ -4,10 +4,9 @@ import uuid
 import zipfile
 import threading
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any
 import subprocess
 import requests
-import re
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,56 +38,19 @@ RUNS_DIR = BASE_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
 # -------------------- util nombres --------------------
-_CD_FILENAME_RE = re.compile(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', re.IGNORECASE)
-
-CONTENT_TYPE_EXT = {
-    "video/mp4": ".mp4",
-    "video/quicktime": ".mov",
-    "video/x-matroska": ".mkv",
-    "video/x-m4v": ".m4v",
-    "video/x-msvideo": ".avi",
-    "video/mxf": ".mxf",
-    "application/octet-stream": "",  # a veces no sabemos
-}
-
-def _basename_from_url(url: str) -> str:
-    """Último segmento de la URL (sin query)."""
+def _safe_name_from_url(url: str) -> str:
+    """
+    Toma el último segmento sin query. Si no hay extensión, asume mp4.
+    """
     name = url.split("?")[0].rstrip("/").split("/")[-1] or "file"
-    return name
-
-def _filename_from_headers(url: str, headers: Dict[str, str]) -> Tuple[str, Optional[str]]:
-    """
-    Intenta obtener nombre desde Content-Disposition. Devuelve (nombre, ext_inferida_por_content_type_o_None).
-    """
-    cd = headers.get("Content-Disposition") or headers.get("content-disposition") or ""
-    ct = headers.get("Content-Type") or headers.get("content-type") or ""
-    # A) Content-Disposition
-    if cd:
-        m = _CD_FILENAME_RE.search(cd)
-        if m:
-            candidate = m.group(1).strip().strip('"')
-            # limpiar espacios codificados
-            candidate = candidate.replace("%20", "_")
-            base = candidate
-            ext = Path(base).suffix
-            if not ext:
-                # inferir por content-type si se puede
-                infer = CONTENT_TYPE_EXT.get(ct.lower())
-                if infer:
-                    base += infer
-            return base, (CONTENT_TYPE_EXT.get(ct.lower()) if not Path(candidate).suffix else None)
-    # B) sin CD: usar la URL
-    base = _basename_from_url(url).replace("%20", "_")
-    ext = Path(base).suffix
-    if not ext:
-        infer = CONTENT_TYPE_EXT.get(ct.lower())
-        if infer:
-            base += infer
-            return base, infer
-    return base, None
+    if "." not in name:
+        name += ".mp4"
+    return name.replace("%20", "_")
 
 def _dedup_path(p: Path) -> Path:
-    """Si p existe, devuelve p con sufijos _2, _3, ..."""
+    """
+    Si p existe, devuelve p con sufijos _2, _3, ...
+    """
     if not p.exists():
         return p
     stem = p.stem
@@ -102,20 +64,13 @@ def _dedup_path(p: Path) -> Path:
 
 # -------------------- descarga --------------------
 def download_many(urls: List[str], dest_dir: Path) -> List[Path]:
-    """
-    Descarga todas las URLs:
-     - Usa Content-Disposition si existe para el nombre
-     - Si no hay extensión, intenta inferir por Content-Type
-     - Evita sobreescrituras
-     - Devuelve la lista de paths en el mismo orden recibido
-    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     out: List[Path] = []
     for u in urls:
+        name = _safe_name_from_url(u)
+        out_path = _dedup_path(dest_dir / name)
         with requests.get(u, stream=True, timeout=60) as r:
             r.raise_for_status()
-            base, _ = _filename_from_headers(u, r.headers)
-            out_path = _dedup_path(dest_dir / base)
             with open(out_path, "wb") as f:
                 for chunk in r.iter_content(1024 * 256):
                     if chunk:
@@ -133,10 +88,8 @@ def _ffmpeg_cmd(in_path: Path, out_path: Path, ratio: str, codec: str) -> List[s
         f"crop={W}:{H},setsar=1/1"
     )
     common = [
-        "ffmpeg","-y","-hide_banner","-loglevel","error",
-        "-i", str(in_path),
-        "-vf", vf,
-        "-movflags","+faststart"
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(in_path), "-vf", vf, "-movflags", "+faststart"
     ]
     if codec == "prores":
         return common + ["-c:v","prores_ks","-profile:v","3","-pix_fmt","yuv422p10le","-c:a","aac","-b:a","192k", str(out_path)]
@@ -162,6 +115,7 @@ def _process_job(job_id: str):
         ratios     = job["ratios"]
         codec      = job["codec"]
         mode       = job.get("mode", "resize")
+        group_by_ratio = bool(job.get("group_by_ratio", False))
 
         # YOLO params (si vienen)
         detect_every = job.get("detect_every", 12)
@@ -184,34 +138,33 @@ def _process_job(job_id: str):
         done_ops = 0
 
         targets = {"9x16": (1080, 1920), "1x1": (1080, 1080), "16x9": (1920, 1080)}
+        if group_by_ratio:
+            for rk in targets:
+                (output_dir / rk).mkdir(parents=True, exist_ok=True)
 
-        for idx, f in enumerate(files, start=1):
+        for f in files:
             job["current_file"] = f.name
-            order_prefix = f"{idx:02d}_"   # <- mantiene orden en outputs
-            clean_stem = f.stem
-
+            stem = f.stem  # ya único por download_many
             for r in ratios:
                 job["current_ratio"] = r
-                W, H = targets.get(r, (1080, 1920))
+                subdir = (output_dir / r) if group_by_ratio else output_dir
 
                 if mode == "tracked_yolo":
                     if yolo_reframe is None:
                         raise RuntimeError("YOLO no disponible (import failed).")
-                    out_name = f"{order_prefix}{clean_stem}_{r}.mp4"  # tracked siempre mp4
-                    out_path = output_dir / out_name
+                    W, H = targets.get(r, (1080, 1920))
+                    out_name = f"{stem}_{r}.mp4"  # tracked siempre mp4
+                    out_path = subdir / out_name
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     yolo_reframe(
                         f, out_path, W, H,
-                        detect_every=int(detect_every),
-                        ema_alpha=float(ema_alpha),
+                        detect_every=detect_every, ema_alpha=float(ema_alpha),
                         pan_cap_px=float(pan_cap_px),
-                        override=None,
-                        model_name=yolo_model,
-                        conf=float(yolo_conf)
+                        override=None, model_name=yolo_model, conf=float(yolo_conf)
                     )
                 else:
-                    out_name = f"{order_prefix}{clean_stem}_{r}.mp4" if codec == "h264" else f"{order_prefix}{clean_stem}_{r}.mov"
-                    out_path = output_dir / out_name
+                    out_name = f"{stem}_{r}.mp4" if codec == "h264" else f"{stem}_{r}.mov"
+                    out_path = subdir / out_name
                     cmd = _ffmpeg_cmd(f, out_path, r, codec)
                     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     if res.returncode != 0:
@@ -250,7 +203,8 @@ def create_job(req: Dict[str, Any]):
         "total_steps":0, "step_index":0, "current_file":None, "current_ratio":None,
         "zip_path":None, "error":None, "mode":mode, "codec":codec,
         "ratios":ratios, "urls":urls, "workdir":str(workdir),
-        # YOLO params opcionales (si el front los manda)
+        "group_by_ratio": bool(req.get("group_by_ratio", False)),
+        # YOLO params opcionales
         "detect_every": req.get("detect_every", 12),
         "ema_alpha":    req.get("ema_alpha", 0.08),
         "pan_cap_px":   req.get("pan_cap_px", 16.0),
