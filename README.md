@@ -20,3 +20,13 @@ cd api
 
 # activar venv si corresponde
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+
+Esto levanta la API en http://127.0.0.1:8000 con endpoints:
+
+POST /jobs → crear un nuevo procesamiento (resize/tracked/tracked_yolo)
+
+GET /jobs/{id} → consultar estado de un job
+
+GET /jobs/{id}/result → descargar ZIP (results.zip)
+
+POST /jobs/{id}/cancel → cancelar un job en curso
