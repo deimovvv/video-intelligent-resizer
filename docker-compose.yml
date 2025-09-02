@@ -7,12 +7,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Activa la feature de Google Drive
+      # (Opcionales) Cache de Ultralytics y Google Drive
+      - YOLO_CONFIG_DIR=/root/.cache/ultralytics
       - GDRIVE_ENABLE=1
-      # Ruta DENTRO del contenedor al JSON del Service Account
       - GOOGLE_APPLICATION_CREDENTIALS=/app/sa.json
     volumes:
-      # Monta tu archivo local api/sa.json dentro del contenedor en /app/sa.json (solo lectura)
+      - ./runs:/app/runs
+      - ./ultra:/root/.cache/ultralytics
       - ./api/sa.json:/app/sa.json:ro
     restart: unless-stopped
 
@@ -21,11 +22,13 @@ services:
       context: ./web
       dockerfile: Dockerfile
     container_name: videoresizer-web
+    # SIN condition:service_healthy → el front arranca igual
     depends_on:
       - api
     environment:
-      # El front hablará con el contenedor "api" en la red interna
       - NEXT_PUBLIC_API_BASE=http://api:8000
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
     ports:
-      - "3000:3000"
+      - "3001:3000"   # cambiá a 3000 si querés
     restart: unless-stopped

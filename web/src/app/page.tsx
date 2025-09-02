@@ -14,6 +14,24 @@ type YoloModel = 'yolov8n.pt' | 'yolov8s.pt';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://127.0.0.1:8000';
 
+type JobResultItem = {
+  stage: 'download' | 'process';
+  status: 'ok' | 'error';
+  url?: string | null;
+  file?: string | null;
+  ratio?: string | null;
+  output?: string | null;
+  reason?: string | null;
+};
+
+type JobSummary = {
+  success: number;
+  errors: number;
+  total: number;
+  download_errors: number;
+  processing_errors: number;
+};
+
 type ApiJobStatus = {
   id?: string;
   phase: 'queued' | 'downloading' | 'processing' | 'zipping' | 'done' | 'error' | 'canceled';
@@ -24,6 +42,8 @@ type ApiJobStatus = {
   current_file?: string | null;
   current_ratio?: string | null;
   error?: string | null;
+  results?: JobResultItem[];
+  summary?: JobSummary;
 };
 
 type JobStatus = {
@@ -36,6 +56,8 @@ type JobStatus = {
   current_file: string | null;
   current_ratio: string | null;
   error: string | null;
+  results: JobResultItem[];
+  summary: JobSummary | null;
 };
 
 type CreateJobBody = {
@@ -57,7 +79,7 @@ export default function Home() {
   const [mode, setMode] = useState<Mode>('resize');
   const [codec, setCodec] = useState<Codec>('h264');
 
-  // knobs YOLO
+  // YOLO knobs
   const [detectEvery, setDetectEvery] = useState<number>(12);
   const [emaAlpha, setEmaAlpha] = useState<number>(0.08);
   const [panCapPx, setPanCapPx] = useState<number>(16);
@@ -65,7 +87,7 @@ export default function Home() {
   const [yoloConf, setYoloConf] = useState<number>(0.35);
   const [activePreset, setActivePreset] = useState<'fast' | 'balanced' | 'accurate' | null>(null);
 
-  // agrupado por ratio
+  // group by ratio
   const [groupByRatio, setGroupByRatio] = useState<boolean>(true);
 
   // drive
@@ -75,6 +97,7 @@ export default function Home() {
   const [job, setJob] = useState<JobStatus | null>(null);
   const pollRef = useRef<NodeJS.Timeout | null>(null);
   const [loading, setLoading] = useState(false);
+  const [showProcessDetails, setShowProcessDetails] = useState(false);
   const [toast, setToast] = useState<{ open: boolean; kind: 'success' | 'error' | 'info'; message: string }>({
     open: false,
     kind: 'info',
@@ -88,11 +111,11 @@ export default function Home() {
 
   const urlErrors = useMemo(() => {
     const errs: string[] = [];
-    if (urls.length === 0) errs.push('Pegá al menos 1 URL.');
+    if (urls.length === 0) errs.push('Paste at least 1 URL.');
     urls.forEach((u, i) => {
-      if (!looksLikeHttp(u)) errs.push(`Línea ${i + 1}: no parece URL http(s).`);
+      if (!looksLikeHttp(u)) errs.push(`Line ${i + 1}: not a valid http(s) URL.`);
     });
-    if (ratios.length === 0) errs.push('Elegí al menos 1 ratio.');
+    if (ratios.length === 0) errs.push('Choose at least 1 ratio.');
     return errs;
   }, [urls, ratios]);
 
@@ -129,6 +152,8 @@ export default function Home() {
           current_file: js.current_file ?? null,
           current_ratio: js.current_ratio ?? null,
           error: js.error ?? null,
+          results: Array.isArray(js.results) ? js.results : [],
+          summary: js.summary ?? null,
         };
         setJob(status);
 
@@ -137,7 +162,7 @@ export default function Home() {
           if (dl.ok) {
             const blob = await dl.blob();
             downloadBlob(blob, 'results.zip');
-            showToast('success', '✔️ Listo: ZIP descargado.');
+            showToast('success', '✔️ Done: ZIP downloaded.');
           } else {
             const txt = await dl.text();
             showToast('error', txt);
@@ -150,9 +175,10 @@ export default function Home() {
           clearPoll();
           setJobId(null);
         } else if (status.phase === 'canceled') {
-          showToast('info', 'Job cancelado.');
+          showToast('info', 'Job canceled.');
           clearPoll();
           setJobId(null);
+          setJob(null);
         }
       } catch {
         // swallow polling errors
@@ -197,13 +223,13 @@ export default function Home() {
         body: JSON.stringify({ folder_url: driveFolder.trim() })
       });
       if (res.status === 501) {
-        showToast('error', 'El servidor no tiene habilitado Google Drive (GDRIVE_ENABLE).');
+        showToast('error', 'Server has Google Drive disabled (GDRIVE_ENABLE).');
         return;
       }
       if (!res.ok) throw new Error(await res.text());
       const js = await res.json() as { files: Array<{downloadUrl:string, name:string}>; count:number; };
       if (!js.files || js.files.length === 0) {
-        showToast('info', 'La carpeta no tiene videos.');
+        showToast('info', 'Folder has no videos.');
         return;
       }
       const newUrls = js.files.map(f => f.downloadUrl);
@@ -213,9 +239,9 @@ export default function Home() {
         const seen = new Set<string>();
         return merged.filter(u => (seen.has(u) ? false : (seen.add(u), true))).join('\n');
       });
-      showToast('success', `Importadas ${js.files.length} URLs desde Drive.`);
+      showToast('success', `Imported ${js.files.length} URL(s) from Drive.`);
     } catch (e: unknown) {
-      showToast('error', `No se pudo leer la carpeta: ${e instanceof Error ? e.message : String(e)}`);
+      showToast('error', `Could not list the folder: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -229,7 +255,7 @@ export default function Home() {
     setLoading(true);
     setJobId(null);
     setJob(null);
-    showToast('info', 'Creando job y comenzando proceso…');
+    showToast('info', 'Creating job and starting…');
 
     const body: CreateJobBody = {
       urls,
@@ -268,10 +294,12 @@ export default function Home() {
         current_file: js.status.current_file ?? null,
         current_ratio: js.status.current_ratio ?? null,
         error: js.status.error ?? null,
+        results: Array.isArray(js.status.results) ? js.status.results : [],
+        summary: js.status.summary ?? null,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      showToast('error', `Error al crear job: ${msg}`);
+      showToast('error', `Could not create job: ${msg}`);
       setLoading(false);
     } finally {
       setLoading(false);
@@ -286,10 +314,10 @@ export default function Home() {
         const txt = await res.text();
         throw new Error(txt);
       }
-      showToast('info', 'Cancelando…');
+      showToast('info', 'Canceling…');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      showToast('error', `No se pudo cancelar: ${msg}`);
+      showToast('error', `Could not cancel: ${msg}`);
     }
   }
 
@@ -306,13 +334,13 @@ export default function Home() {
 
   const busy = !!(loading || (job && ['queued', 'downloading', 'processing', 'zipping'].includes(job.phase)));
   const phaseNice: Record<JobStatus['phase'], string> = {
-    queued: 'En cola…',
-    downloading: 'Descargando…',
-    processing: 'Procesando…',
-    zipping: 'Empaquetando…',
-    done: 'Listo',
+    queued: 'Queued…',
+    downloading: 'Downloading…',
+    processing: 'Processing…',
+    zipping: 'Zipping…',
+    done: 'Done',
     error: 'Error',
-    canceled: 'Cancelado',
+    canceled: 'Canceled',
   };
 
   return (
@@ -323,19 +351,19 @@ export default function Home() {
           <div className="max-w-5xl mx-auto px-6 py-10">
             <header className="mb-8">
               <h1 className="text-3xl font-semibold tracking-tight">MediaMonks · Batch Resizer</h1>
-              <p className="text-neutral-400 mt-2">Interfaz conectada a {API_BASE}</p>
+              <p className="text-neutral-400 mt-2">Connected to {API_BASE}</p>
             </header>
 
             {(busy || job) && (
               <div className="mb-5 bg-neutral-900 rounded-2xl p-5">
                 <div className="flex items-center justify-between gap-4">
                   <div>
-                    <div className="text-sm text-neutral-300">{job ? phaseNice[job.phase] : 'Iniciando…'}</div>
+                    <div className="text-sm text-neutral-300">{job ? phaseNice[job.phase] : 'Starting…'}</div>
                     <div className="text-xs text-neutral-500">
                       {job?.message}
                       {job?.current_ratio ? ` · ratio ${job.current_ratio}` : ''}
                       {job?.current_file ? ` · ${job.current_file}` : ''}
-                      {job?.total_steps ? ` · paso ${Math.min(job.step_index, job.total_steps)}/${job.total_steps}` : ''}
+                      {job?.total_steps ? ` · step ${Math.min(job.step_index, job.total_steps)}/${job.total_steps}` : ''}
                     </div>
                   </div>
                   {job && ['queued', 'downloading', 'processing', 'zipping'].includes(job.phase) && (
@@ -343,7 +371,7 @@ export default function Home() {
                       onClick={handleCancel}
                       className="rounded-lg px-3 py-2 bg-neutral-800 hover:bg-neutral-700 text-sm"
                     >
-                      Cancelar
+                      Cancel
                     </button>
                   )}
                 </div>
@@ -353,10 +381,87 @@ export default function Home() {
               </div>
             )}
 
+            {/* -------- Process details (results + summary) -------- */}
+            {(job || loading) && (
+              <section className="mb-6 bg-neutral-900 rounded-2xl p-5">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-lg font-medium">Process details</h3>
+                    <p className="text-xs text-neutral-400 mt-1">
+                      {job?.summary
+                        ? `Success: ${job.summary.success} · Errors: ${job.summary.errors} · Total: ${job.summary.total} · Download errors: ${job.summary.download_errors} · Processing errors: ${job.summary.processing_errors}`
+                        : 'No summary yet'}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setShowProcessDetails(!showProcessDetails)}
+                    className="flex items-center gap-2 px-3 py-2 text-sm text-neutral-400 hover:text-neutral-200 transition-colors"
+                  >
+                    {showProcessDetails ? 'Hide details' : 'Show details'}
+                    <span className={`transform transition-transform duration-200 ${showProcessDetails ? 'rotate-180' : ''}`}>
+                      ⌄
+                    </span>
+                  </button>
+                </div>
+
+                {showProcessDetails && (
+                  <div className="mt-4 border border-neutral-800 rounded-xl overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-neutral-800/60">
+                        <tr>
+                          <th className="text-left px-3 py-2 font-medium">Stage</th>
+                          <th className="text-left px-3 py-2 font-medium">File / URL</th>
+                          <th className="text-left px-3 py-2 font-medium">Ratio</th>
+                          <th className="text-left px-3 py-2 font-medium">Status</th>
+                          <th className="text-left px-3 py-2 font-medium">Output / Reason</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {job?.results && job.results.length > 0 ? (
+                          job.results.map((it, idx) => (
+                            <tr key={idx} className="border-t border-neutral-800">
+                              <td className="px-3 py-2 text-neutral-300">
+                                {it.stage === 'download' ? 'Download' : 'Process'}
+                              </td>
+                              <td className="px-3 py-2 text-neutral-300">
+                                {it.file || it.url || '-'}
+                              </td>
+                              <td className="px-3 py-2 text-neutral-400">{it.ratio || '-'}</td>
+                              <td className="px-3 py-2">
+                                <span
+                                  className={`px-2 py-0.5 rounded text-xs ${
+                                    it.status === 'ok' ? 'bg-emerald-600/20 text-emerald-300' : 'bg-rose-600/20 text-rose-300'
+                                  }`}
+                                >
+                                  {it.status === 'ok' ? 'OK' : 'Error'}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2 text-neutral-400">
+                                {it.status === 'ok' ? (it.output || '-') : (it.reason || '-')}
+                              </td>
+                            </tr>
+                          ))
+                        ) : (
+                          <tr>
+                            <td colSpan={5} className="px-3 py-6 text-center text-neutral-500">
+                              No details yet.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+            )}
+
             <form onSubmit={handleSubmit} className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               <section className="lg:col-span-2 space-y-6">
                 <div className="bg-neutral-900 rounded-2xl p-5">
-                  <FieldLabel label="Importar desde carpeta de Google Drive" hint="Pegá el link a la carpeta (…/folders/<id>). Requiere GDRIVE_ENABLE y credenciales en el servidor." />
+                  <FieldLabel
+                    label="Import from Google Drive folder"
+                    hint="Paste the folder link (…/folders/<id>). Requires GDRIVE_ENABLE and credentials on the server."
+                  />
                   <div className="flex gap-3 mb-3">
                     <input
                       className="flex-1 rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
@@ -364,6 +469,7 @@ export default function Home() {
                       value={driveFolder}
                       onChange={(e)=>setDriveFolder(e.target.value)}
                       disabled={busy}
+                      suppressHydrationWarning
                     />
                     <button
                       type="button"
@@ -371,11 +477,11 @@ export default function Home() {
                       disabled={busy || !driveFolder.trim()}
                       className="rounded-lg px-4 py-2 bg-neutral-800 hover:bg-neutral-700"
                     >
-                      Importar
+                      Import
                     </button>
                   </div>
 
-                  <FieldLabel label="URLs (una por línea)" hint="Podés pegar varias; se renombran automáticamente si repiten nombre." />
+                  <FieldLabel label="URLs (one per line)" hint="You can paste many; names are automatically deduplicated." />
                   <textarea
                     className="w-full h-40 rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
                     placeholder={'https://example.com/video1.mp4\nhttps://example.com/video2.mp4'}
@@ -390,31 +496,33 @@ export default function Home() {
                 <div className="bg-neutral-900 rounded-2xl p-5 space-y-4">
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                     <div>
-                      <FieldLabel label="Modo" hint="Resize = FFmpeg; Tracked YOLO = detección+seguimiento" />
+                      <FieldLabel label="Mode" hint="Resize = FFmpeg; Tracked YOLO = detection + tracking" />
                       <select
                         className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
                         value={mode}
                         onChange={(e) => setMode(e.target.value as Mode)}
                         disabled={busy}
+                        suppressHydrationWarning
                       >
                         <option value="resize">Resize (FFmpeg)</option>
                         <option value="tracked_yolo">Tracked YOLO</option>
                       </select>
                     </div>
                     <div>
-                      <FieldLabel label="Codec" hint="H.264 o ProRes (solo Resize)" />
+                      <FieldLabel label="Codec" hint="H.264 or ProRes (Resize only)" />
                       <select
                         className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
                         value={codec}
                         onChange={(e) => setCodec(e.target.value as Codec)}
                         disabled={busy || mode === 'tracked_yolo'}
+                        suppressHydrationWarning
                       >
                         <option value="h264">H.264 (MP4)</option>
                         <option value="prores">ProRes</option>
                       </select>
                     </div>
                     <div>
-                      <FieldLabel label="Ratios" hint="Elegí uno o más." />
+                      <FieldLabel label="Ratios" hint="Pick one or more." />
                       <div className="flex items-center gap-4 flex-wrap">
                         {(['9x16', '1x1', '16x9'] as Ratio[]).map((r) => (
                           <label key={r} className="inline-flex items-center gap-2">
@@ -442,7 +550,7 @@ export default function Home() {
                       disabled={busy}
                     />
                     <label htmlFor="gbr" className="text-sm">
-                      Carpetas por ratio en el ZIP
+                      Folders per ratio in ZIP
                     </label>
                   </div>
 
@@ -458,7 +566,7 @@ export default function Home() {
                           onClick={() => applyPreset('fast')}
                           disabled={busy}
                         >
-                          Rápido
+                          Fast
                         </button>
                         <button
                           type="button"
@@ -468,7 +576,7 @@ export default function Home() {
                           onClick={() => applyPreset('balanced')}
                           disabled={busy}
                         >
-                          Balanceado
+                          Balanced
                         </button>
                         <button
                           type="button"
@@ -478,14 +586,14 @@ export default function Home() {
                           onClick={() => applyPreset('accurate')}
                           disabled={busy}
                         >
-                          Preciso
+                          Accurate
                         </button>
                         {activePreset && <span className="text-xs text-neutral-500">({activePreset})</span>}
                       </div>
 
                       <div className="border-t border-neutral-800 pt-4 grid grid-cols-1 md:grid-cols-5 gap-4">
                         <div>
-                          <FieldLabel label="detect_every" hint="Frames entre redetecciones (↑ = más rápido)" />
+                          <FieldLabel label="detect_every" hint="Frames between re-detections (↑ = faster)" />
                           <input
                             type="number"
                             className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
@@ -499,7 +607,7 @@ export default function Home() {
                           />
                         </div>
                         <div>
-                          <FieldLabel label="ema_alpha" hint="Suavizado (0–1). Más bajo = más suave." />
+                          <FieldLabel label="ema_alpha" hint="Smoothing (0–1). Lower = smoother." />
                           <input
                             type="number"
                             step={0.01}
@@ -513,7 +621,7 @@ export default function Home() {
                           />
                         </div>
                         <div>
-                          <FieldLabel label="pan_cap_px" hint="Límite de paneo por frame (px)" />
+                          <FieldLabel label="pan_cap_px" hint="Pan cap per frame (px)" />
                           <input
                             type="number"
                             className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
@@ -526,7 +634,7 @@ export default function Home() {
                           />
                         </div>
                         <div>
-                          <FieldLabel label="yolo_model" hint="n = más rápido, s = más preciso" />
+                          <FieldLabel label="yolo_model" hint="n = faster, s = more accurate" />
                           <select
                             className="w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2"
                             value={yoloModel}
@@ -541,7 +649,7 @@ export default function Home() {
                           </select>
                         </div>
                         <div>
-                          <FieldLabel label="yolo_conf" hint="Umbral de confianza (0–1)" />
+                          <FieldLabel label="yolo_conf" hint="Confidence threshold (0–1)" />
                           <input
                             type="number"
                             step={0.01}
@@ -562,14 +670,14 @@ export default function Home() {
 
               <aside className="space-y-6">
                 <div className="bg-neutral-900 rounded-2xl p-5">
-                  <h3 className="text-lg font-medium mb-3">Acciones</h3>
+                  <h3 className="text-lg font-medium mb-3">Actions</h3>
                   <button
                     type="submit"
                     onClick={handleSubmit}
                     disabled={busy || urlErrors.length > 0}
                     className="w-full rounded-xl px-4 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60"
                   >
-                    {busy ? 'Procesando…' : 'Procesar y descargar ZIP'}
+                    {busy ? 'Processing…' : 'Process and download ZIP'}
                   </button>
                 </div>
               </aside>

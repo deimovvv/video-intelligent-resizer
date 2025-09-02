@@ -1,4 +1,3 @@
-# api/main.py
 from __future__ import annotations
 
 import uuid
@@ -9,9 +8,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import subprocess
 import requests
 import os
-import re
-import mimetypes
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +26,7 @@ except Exception:
 
 app = FastAPI(title="Batch Resizer API")
 
+# CORS correcto (vía add_middleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,81 +36,34 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+# ---- Estado en memoria ----
 JOBS: Dict[str, Dict[str, Any]] = {}
 RUNS_DIR = BASE_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
-# -------------------- helpers de nombres/headers --------------------
-_WINDOWS_BAD = r'<>:"/\\|?*'
-_BAD_RE = re.compile(rf"[{re.escape(_WINDOWS_BAD)}]")
-
-def _sanitize_filename(name: str, maxlen: int = 120) -> str:
-    """Limpia caracteres problemáticos y trunca con cuidado."""
-    name = name.strip().replace("\n", " ").replace("\r", " ")
-    name = _BAD_RE.sub("_", name)
-    name = name.replace("%20", "_")
-    if len(name) > maxlen:
-        root, ext = os.path.splitext(name)
-        name = (root[: max(1, maxlen - len(ext) - 3)] + "…") + ext
-    # Evitar nombres vacíos/raros
-    if not name or name in {".", ".."}:
-        name = "file.mp4"
-    return name
-
-def _ensure_extension(name: str, content_type: Optional[str]) -> str:
-    """Si no tiene extensión, intenta inferir por content-type; default .mp4."""
-    root, ext = os.path.splitext(name)
-    if ext:
-        return name
-    if content_type:
-        guessed = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
-        if guessed:
-            # Normalizar algunos tipos comunes
-            if guessed == ".m4v":
-                guessed = ".mp4"
-            return name + guessed
-    return name + ".mp4"
-
-def _parse_cd_filename(cd: str) -> Optional[str]:
+# -------------------- util nombres --------------------
+def _safe_name_from_url(url: str) -> str:
     """
-    Parse RFC 5987/6266 Content-Disposition:
-    - filename*=UTF-8''nombre.ext
-    - filename="nombre.ext"
+    Obtiene un nombre de archivo a partir de la URL.
+    - Respeta ?filename=... cuando viene de Google Drive API (expand).
+    - Si no hay extensión, asume .mp4
     """
-    if not cd:
-        return None
-    # filename*=
-    m = re.search(r"filename\*\s*=\s*([^']*)''([^;]+)", cd, re.IGNORECASE)
-    if m:
-        # charset = m.group(1) (no usamos, asumimos UTF-8)
-        fn = requests.utils.unquote(m.group(2))
-        return fn.strip().strip('"')
-    # filename=
-    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"filename\s*=\s*([^;]+)", cd, re.IGNORECASE)
-    if m:
-        return m.group(1).strip().strip('"')
-    return None
-
-def _last_segment_name(u: str) -> str:
-    """Último segmento de la URL sin query; si vacío, 'file.mp4'."""
-    name = u.split("?")[0].rstrip("/").split("/")[-1] or "file"
-    if "." not in name:
-        name += ".mp4"
-    return name
-
-def _name_from_query_filename(u: str) -> Optional[str]:
-    """Si la URL trae ?filename=... úsalo (tu caso con Drive v3)."""
     try:
-        q = parse_qs(urlparse(u).query)
-        vals = q.get("filename")
-        if vals and vals[0]:
-            return vals[0]
+        parsed = urlparse(url)
+        q = parse_qs(parsed.query or "")
+        if "filename" in q and q["filename"]:
+            name = q["filename"][0]
+            name = name.replace("/", "_").replace("\\", "_")
+            if "." not in name:
+                name += ".mp4"
+            return name
     except Exception:
         pass
-    return None
+
+    name = url.split("?")[0].rstrip("/").split("/")[-1] or "file"
+    if "." not in name:
+        name += ".mp4"
+    return name.replace("%20", "_")
 
 def _dedup_path(p: Path) -> Path:
     """Si p existe, devuelve p con sufijos _2, _3, ..."""
@@ -127,8 +78,76 @@ def _dedup_path(p: Path) -> Path:
             return cand
         i += 1
 
+def _extract_drive_file_id(url: str) -> Optional[str]:
+    """Detecta FILE ID en enlaces de Drive tipo /uc?id=... o /file/d/<id>/..."""
+    try:
+        p = urlparse(url)
+        if p.netloc not in ("drive.google.com", "www.drive.google.com"):
+            return None
+        qs = parse_qs(p.query or "")
+        if "id" in qs and qs["id"]:
+            return qs["id"][0]
+        # patrón /file/d/<id>/...
+        parts = [x for x in p.path.split("/") if x]
+        if "file" in parts:
+            i = parts.index("file")
+            if i + 2 < len(parts) and parts[i+1] == "d":
+                return parts[i+2]
+    except Exception:
+        return None
+    return None
+
+def _filename_from_content_disposition(cd: str) -> Optional[str]:
+    """
+    Extrae filename de un header Content-Disposition.
+    Soporta filename* (RFC 5987) y filename=.
+    """
+    try:
+        cd_lower = cd.lower()
+        # filename*=
+        if "filename*=" in cd_lower:
+            # ejemplo: filename*=UTF-8''my%20file.mp4
+            part = cd_lower.split("filename*=")[1].split(";")[0].strip()
+            # quitamos comillas si hay
+            part = part.strip('"').strip("'")
+            # formato <charset>''<nombre_urlencoded>
+            if "''" in part:
+                enc_name = part.split("''", 1)[1]
+            else:
+                enc_name = part
+            name = unquote(enc_name)
+            return name
+        # filename=
+        if "filename=" in cd_lower:
+            part = cd.split("filename=")[1].split(";")[0].strip()
+            part = part.strip('"').strip("'")
+            return part
+    except Exception:
+        pass
+    return None
+
+def _gdrive_filename_via_api(file_id: str) -> Optional[str]:
+    """
+    Si hay credenciales (GDRIVE_ENABLE + GOOGLE_APPLICATION_CREDENTIALS),
+    intenta pedir a la API de Drive el nombre real del archivo.
+    """
+    try:
+        headers = _gdrive_bearer_headers()
+        if not headers:
+            return None
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=name"
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.ok:
+            data = r.json()
+            name = data.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    except Exception:
+        return None
+    return None
+
 # -------------------- Google Drive helpers (opcionales) --------------------
-def _extract_drive_folder_id(folder_url: str) -> str | None:
+def _extract_drive_folder_id(folder_url: str) -> Optional[str]:
     try:
         p = urlparse(folder_url)
         if p.netloc not in ("drive.google.com", "www.drive.google.com"):
@@ -166,63 +185,107 @@ def _gdrive_bearer_headers() -> Dict[str, str]:
     except Exception:
         return {}
 
-# -------------------- descarga (con nombre correcto) --------------------
-def download_many(urls: List[str], dest_dir: Path) -> List[Path]:
+# -------------------- helpers results/summary --------------------
+def _init_results_summary(job: Dict[str, Any]) -> None:
+    job["results"] = []  # lista de items detallados
+    job["summary"] = {
+        "success": 0,
+        "errors": 0,
+        "total": 0,
+        "download_errors": 0,
+        "processing_errors": 0,
+    }
+
+def _push_result(job: Dict[str, Any], *,
+                 stage: str,                # "download" | "process"
+                 status: str,               # "ok" | "error"
+                 url: Optional[str] = None,
+                 file: Optional[str] = None,
+                 ratio: Optional[str] = None,
+                 output: Optional[str] = None,
+                 reason: Optional[str] = None) -> None:
+    item = {
+        "stage": stage,
+        "status": status,
+        "url": url,
+        "file": file,
+        "ratio": ratio,
+        "output": output,
+        "reason": reason,
+    }
+    job["results"].append(item)
+    s = job["summary"]
+    s["total"] += 1
+    if status == "ok":
+        s["success"] += 1
+    else:
+        s["errors"] += 1
+        if stage == "download":
+            s["download_errors"] += 1
+        elif stage == "process":
+            s["processing_errors"] += 1
+
+# -------------------- descarga --------------------
+def download_many(job: Dict[str, Any], urls: List[str], dest_dir: Path) -> List[Tuple[Path, str]]:
     """
-    Baja todas las URLs a dest_dir.
-    Regla de nombre:
-      1) Content-Disposition (filename* / filename)
-      2) ?filename= de la URL (ya soporta Drive API v3)
-      3) último segmento de la URL (fallback; evita 'uc' si el header venía)
-    Se sanitiza y se asegura extensión por Content-Type si falta.
+    Descarga cada URL a dest_dir.
+    - Devuelve lista de (ruta_local, url) SOLO de descargas exitosas.
+    - Registra en job['results'] cada intento (ok/error).
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
-    out: List[Path] = []
-
-    drive_headers_cache: Dict[str, str] | None = None
+    out: List[Tuple[Path, str]] = []
+    drive_headers_cache: Optional[Dict[str, str]] = None
 
     for u in urls:
+        # nombre tentativo basado en la URL
+        tentative_name = _safe_name_from_url(u)
+        out_path = _dedup_path(dest_dir / tentative_name)
+
         headers: Dict[str, str] = {}
+        # Soporte a enlaces de la Google Drive Files API (?alt=media)
         if "www.googleapis.com/drive/v3/files/" in u and "alt=media" in u:
             if drive_headers_cache is None:
                 drive_headers_cache = _gdrive_bearer_headers()
             headers = drive_headers_cache or {}
 
-        # GET (abrimos primero para leer headers)
-        with requests.get(
-            u,
-            stream=True,
-            timeout=(10, None),          # connect 10s, read stream sin límite
-            headers=headers,
-            allow_redirects=True,
-        ) as r:
-            r.raise_for_status()
+        try:
+            with requests.get(u, stream=True, timeout=120, headers=headers) as r:
+                r.raise_for_status()
 
-            # 1) Intentar Content-Disposition
-            cd = r.headers.get("Content-Disposition") or r.headers.get("content-disposition")
-            name = _parse_cd_filename(cd) if cd else None
+                # 1) ¿El servidor nos dice el nombre real?
+                cd = r.headers.get("Content-Disposition") or r.headers.get("content-disposition")
+                real_name = _filename_from_content_disposition(cd) if cd else None
 
-            # 2) Intentar query ?filename=
-            if not name:
-                name = _name_from_query_filename(u)
+                # 2) ¿Es un link de Drive (uc/file/d) y tenemos creds? probamos API.
+                if not real_name:
+                    fid = _extract_drive_file_id(u)
+                    if fid:
+                        real_name = _gdrive_filename_via_api(fid)
 
-            # 3) Fallback: último segmento de la URL
-            if not name:
-                name = _last_segment_name(u)
+                if real_name:
+                    real_name = real_name.replace("/", "_").replace("\\", "_")
+                    if "." not in real_name:
+                        real_name += ".mp4"
+                    out_path = _dedup_path(dest_dir / real_name)
 
-            # Sanitizar e intentar asegurar extensión por content-type
-            content_type = r.headers.get("Content-Type")
-            name = _sanitize_filename(name)
-            name = _ensure_extension(name, content_type)
+                # descargar al nombre final decidido
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(1024 * 256):
+                        if chunk:
+                            f.write(chunk)
 
-            out_path = _dedup_path(dest_dir / name)
+            _push_result(job, stage="download", status="ok", url=u, file=out_path.name)
+            out.append((out_path, u))
 
-            with open(out_path, "wb") as f:
-                for chunk in r.iter_content(1024 * 256):
-                    if chunk:
-                        f.write(chunk)
+        except Exception as e:
+            _push_result(job, stage="download", status="error", url=u, reason=str(e))
 
-            out.append(out_path)
+        # Avance de progreso por descarga
+        try:
+            job["done_ops"] += 1
+            _update_progress(job)
+        except Exception:
+            pass
 
     return out
 
@@ -250,6 +313,28 @@ def _zip_dir(src_dir: Path, zip_path: Path) -> None:
             if p.is_file():
                 z.write(p, arcname=p.name)  # solo el nombre limpio
 
+# -------------------- progreso --------------------
+def _recompute_total_ops(job: Dict[str, Any]) -> None:
+    """
+    total_ops = intentos de descarga (len(urls)) + (descargas exitosas * len(ratios))
+    """
+    urls = job["urls"]
+    ratios = job["ratios"]
+    downloads = len(urls)
+    # si ya hubo descargas, contamos solo las OK que quedaron en job["_download_ok_count"]
+    dl_ok = job.get("_download_ok_count")
+    if dl_ok is None:
+        # aún no descargamos: estima con todos
+        job["total_ops"] = downloads + max(1, downloads) * max(1, len(ratios))
+    else:
+        job["total_ops"] = downloads + dl_ok * max(1, len(ratios))
+
+def _update_progress(job: Dict[str, Any]) -> None:
+    total = max(1, job.get("total_ops", 1))
+    done = max(0, job.get("done_ops", 0))
+    # mapeo 5..95 para etapas de trabajo
+    job["progress"] = min(95, max(5, int(5 + (done / total) * 90)))
+
 # -------------------- worker --------------------
 def _process_job(job_id: str):
     job = JOBS.get(job_id)
@@ -266,24 +351,33 @@ def _process_job(job_id: str):
         group_by_ratio = bool(job.get("group_by_ratio", False))
 
         # YOLO params (si vienen)
-        detect_every = job.get("detect_every", 12)
-        ema_alpha    = job.get("ema_alpha", 0.08)
-        pan_cap_px   = job.get("pan_cap_px", 16.0)
+        detect_every = int(job.get("detect_every", 12))
+        ema_alpha    = float(job.get("ema_alpha", 0.08))
+        pan_cap_px   = float(job.get("pan_cap_px", 16.0))
         yolo_model   = job.get("yolo_model", "yolov8n.pt")
-        yolo_conf    = job.get("yolo_conf", 0.35)
+        yolo_conf    = float(job.get("yolo_conf", 0.35))
 
-        job.update(dict(phase="downloading", message="Descargando archivos…", progress=3))
-        files = download_many(urls, input_dir)
+        # Inicialización de resultados/resumen/progreso
+        _init_results_summary(job)
+        job.update(dict(phase="downloading", message="Downloading files…"))
+        job["done_ops"] = 0
+        _recompute_total_ops(job)
+        _update_progress(job)
+
+        # --- Descargas ---
+        pairs = download_many(job, urls, input_dir)  # [(path, url), ...]
+        files = [p for p, _ in pairs]
+        job["_download_ok_count"] = len(files)
         if not files:
-            raise RuntimeError("No se descargaron archivos")
+            raise RuntimeError("No files were downloaded.")
 
-        total_ops = max(1, len(files) * max(1, len(ratios)))
-        job["total_steps"] = total_ops
-        job["step_index"] = 0
+        # recalcular total_ops con base en descargas OK
+        _recompute_total_ops(job)
+        _update_progress(job)
 
-        job.update(dict(phase="processing", message="Procesando…", progress=10))
+        # --- Procesado ---
+        job.update(dict(phase="processing", message="Processing…"))
         output_dir.mkdir(exist_ok=True)
-        done_ops = 0
 
         targets = {"9x16": (1080, 1920), "1x1": (1080, 1080), "16x9": (1920, 1080)}
         if group_by_ratio:
@@ -292,42 +386,54 @@ def _process_job(job_id: str):
 
         for f in files:
             job["current_file"] = f.name
-            stem = f.stem  # único por download_many
+            stem = f.stem
             for r in ratios:
                 job["current_ratio"] = r
                 subdir = (output_dir / r) if group_by_ratio else output_dir
+                subdir.mkdir(parents=True, exist_ok=True)
 
-                if mode == "tracked_yolo":
-                    if yolo_reframe is None:
-                        raise RuntimeError("YOLO no disponible (import failed).")
-                    W, H = targets.get(r, (1080, 1920))
-                    out_name = f"{stem}_TRACKED_{r}.mp4"
-                    out_path = subdir / out_name
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    yolo_reframe(
-                        f, out_path, W, H,
-                        detect_every=detect_every, ema_alpha=float(ema_alpha),
-                        pan_cap_px=float(pan_cap_px),
-                        override=None, model_name=yolo_model, conf=float(yolo_conf)
-                    )
-                else:
-                    ext = "mp4" if codec == "h264" else "mov"
-                    out_name = f"{stem}_RESIZE_{r}.{ext}"
-                    out_path = subdir / out_name
-                    cmd = _ffmpeg_cmd(f, out_path, r, codec)
-                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                    if res.returncode != 0:
-                        raise RuntimeError(f"FFmpeg falló en {f.name} ({r}): {res.stderr[-800:]}")
+                try:
+                    if mode == "tracked_yolo":
+                        if yolo_reframe is None:
+                            raise RuntimeError("YOLO is not available (import failed).")
+                        W, H = targets.get(r, (1080, 1920))
+                        out_name = f"{stem}_TRACKED_{r}.mp4"
+                        out_path = subdir / out_name
+                        yolo_reframe(
+                            f, out_path, W, H,
+                            detect_every=detect_every, ema_alpha=ema_alpha,
+                            pan_cap_px=pan_cap_px,
+                            override=None, model_name=yolo_model, conf=yolo_conf
+                        )
+                    else:
+                        ext = "mp4" if codec == "h264" else "mov"
+                        out_name = f"{stem}_RESIZE_{r}.{ext}"
+                        out_path = subdir / out_name
+                        cmd = _ffmpeg_cmd(f, out_path, r, codec)
+                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        if res.returncode != 0:
+                            raise RuntimeError(res.stderr[-800:] if res.stderr else "FFmpeg failed.")
 
-                done_ops += 1
-                job["step_index"] = done_ops
-                job["progress"] = min(95, 10 + int(80 * done_ops / total_ops))
+                    # OK
+                    _push_result(job, stage="process", status="ok",
+                                 url=None, file=f.name, ratio=r,
+                                 output=out_path.name, reason=None)
+                except Exception as e:
+                    # ERROR
+                    _push_result(job, stage="process", status="error",
+                                 url=None, file=f.name, ratio=r,
+                                 output=None, reason=str(e))
 
-        job.update(dict(phase="zipping", message="Empaquetando ZIP…", current_file=None, current_ratio=None, progress=97))
+                # avance de progreso por cada salida (ok o error)
+                job["done_ops"] += 1
+                _update_progress(job)
+
+        # --- Zipeo ---
+        job.update(dict(phase="zipping", message="Creating ZIP…", current_file=None, current_ratio=None))
         zip_path = workdir / "results.zip"
         _zip_dir(output_dir, zip_path)
 
-        job.update(dict(phase="done", message="Listo", progress=100, zip_path=str(zip_path)))
+        job.update(dict(phase="done", message="Done", progress=100, zip_path=str(zip_path)))
     except Exception as e:
         job.update(dict(phase="error", message="Error", error=str(e), progress=100))
 
@@ -348,19 +454,23 @@ def create_job(req: Dict[str, Any]):
     (workdir / "output").mkdir(parents=True, exist_ok=True)
 
     status = {
-        "id": job_id, "phase":"queued", "message":"En cola…", "progress":0,
+        "id": job_id, "phase":"queued", "message":"Queued…", "progress":0,
         "total_steps":0, "step_index":0, "current_file":None, "current_ratio":None,
         "zip_path":None, "error":None, "mode":mode, "codec":codec,
         "ratios":ratios, "urls":urls, "workdir":str(workdir),
         "group_by_ratio": bool(req.get("group_by_ratio", False)),
         # YOLO params opcionales
-        "detect_every": req.get("detect_every", 12),
-        "ema_alpha":    req.get("ema_alpha", 0.08),
-        "pan_cap_px":   req.get("pan_cap_px", 16.0),
+        "detect_every": int(req.get("detect_every", 12)),
+        "ema_alpha":    float(req.get("ema_alpha", 0.08)),
+        "pan_cap_px":   float(req.get("pan_cap_px", 16.0)),
         "yolo_model":   req.get("yolo_model", "yolov8n.pt"),
-        "yolo_conf":    req.get("yolo_conf", 0.35),
+        "yolo_conf":    float(req.get("yolo_conf", 0.35)),
     }
     JOBS[job_id] = status
+    # extras para el worker
+    JOBS[job_id]["workdir"] = str(workdir)  # ya está
+    # results/summary los inicializa el worker al empezar
+
     threading.Thread(target=_process_job, args=(job_id,), daemon=True).start()
     return {"job_id": job_id, "status": status}
 
@@ -370,6 +480,11 @@ def get_job(job_id: str):
     if not job:
         raise HTTPException(404, "Job no encontrado")
     public = {k: v for k, v in job.items() if k not in ("workdir",)}
+    # asegurar results/summary aunque el worker no haya empezado
+    public.setdefault("results", [])
+    public.setdefault("summary", {
+        "success": 0,"errors": 0,"total": 0,"download_errors": 0,"processing_errors": 0
+    })
     return JSONResponse(public)
 
 @app.get("/jobs/{job_id}/result")
@@ -389,7 +504,7 @@ def cancel_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job no encontrado")
-    job.update(dict(phase="canceled", message="Cancelado por el usuario.", progress=100))
+    job.update(dict(phase="canceled", message="Canceled by user.", progress=100))
     return {"ok": True}
 
 # --------- Expand Google Drive Folder (opcional) ----------
@@ -421,6 +536,7 @@ def expand_google_drive_folder(req: Dict[str, Any]):
             for f in resp.get("files", []):
                 fid = f["id"]
                 dl = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+                # Agregamos el nombre original como parámetro para que _safe_name_from_url lo use
                 dl_with_name = f"{dl}&filename={f.get('name', 'video.mp4')}"
                 files.append({
                     "id": fid,
@@ -438,6 +554,7 @@ def expand_google_drive_folder(req: Dict[str, Any]):
     except HTTPException:
         raise
     except RuntimeError as e:
+        # Error de credenciales
         raise HTTPException(500, f"Error de configuración: {e}")
     except Exception as e:
         error_msg = str(e)
