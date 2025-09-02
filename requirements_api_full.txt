@@ -7,3 +7,6 @@ mediapipe==0.10.14
 ultralytics==8.3.189
 pydantic==2.11.3
 typing-extensions==4.12.2
+google-api-python-client>=2.136.0
+google-auth>=2.33.0
+google-auth-httplib2>=0.2.0

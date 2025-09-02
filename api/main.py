@@ -1,26 +1,28 @@
+# api/main.py
 from __future__ import annotations
 
 import uuid
 import zipfile
 import threading
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import subprocess
 import requests
+import os
 import re
 import mimetypes
-from urllib.parse import urlparse, unquote, parse_qs
+from urllib.parse import urlparse, parse_qs
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-# --- import del reframe YOLO (archivo en scripts/) ---
+# --- import del reframe YOLO (tu archivo en scripts/) ---
 import sys as _sys
 BASE_DIR = Path(__file__).resolve().parents[1]
 _sys.path.insert(0, str(BASE_DIR / "scripts"))
 try:
-    # yolo_reframe(src, dst, w, h, detect_every, ema_alpha, pan_cap_px, override, model_name, conf)
+    # reframe_video(src, dst, w, h, detect_every, ema_alpha, pan_cap_px, override, model_name, conf)
     from batch_reframe_track_yolo import reframe_video as yolo_reframe
 except Exception:
     yolo_reframe = None
@@ -40,76 +42,84 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 RUNS_DIR = BASE_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
-# -------------------- helpers de nombres/descarga --------------------
-_CONTENT_TYPE_EXT = {
-    "video/mp4": ".mp4",
-    "video/quicktime": ".mov",
-    "video/x-matroska": ".mkv",
-    "video/x-msvideo": ".avi",
-    "video/mpeg": ".mpg",
-}
-_INVALID_WIN_CHARS = r'<>:"/\|?*\0'
+# -------------------- helpers de nombres/headers --------------------
+_WINDOWS_BAD = r'<>:"/\\|?*'
+_BAD_RE = re.compile(rf"[{re.escape(_WINDOWS_BAD)}]")
 
-def _sanitize_filename(name: str) -> str:
-    name = "".join(c for c in name if c not in _INVALID_WIN_CHARS).strip()
-    if not name or name.upper() in {
-        "CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
-        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
-    }:
-        name = "file"
+def _sanitize_filename(name: str, maxlen: int = 120) -> str:
+    """Limpia caracteres problemáticos y trunca con cuidado."""
+    name = name.strip().replace("\n", " ").replace("\r", " ")
+    name = _BAD_RE.sub("_", name)
+    name = name.replace("%20", "_")
+    if len(name) > maxlen:
+        root, ext = os.path.splitext(name)
+        name = (root[: max(1, maxlen - len(ext) - 3)] + "…") + ext
+    # Evitar nombres vacíos/raros
+    if not name or name in {".", ".."}:
+        name = "file.mp4"
     return name
 
-def _ext_from_content_type(ct: str | None) -> str:
-    if not ct:
-        return ".mp4"
-    ct = ct.split(";")[0].strip().lower()
-    return _CONTENT_TYPE_EXT.get(ct) or (mimetypes.guess_extension(ct) or ".mp4")
+def _ensure_extension(name: str, content_type: Optional[str]) -> str:
+    """Si no tiene extensión, intenta inferir por content-type; default .mp4."""
+    root, ext = os.path.splitext(name)
+    if ext:
+        return name
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
+        if guessed:
+            # Normalizar algunos tipos comunes
+            if guessed == ".m4v":
+                guessed = ".mp4"
+            return name + guessed
+    return name + ".mp4"
 
-def _filename_from_content_disposition(cd: str | None) -> str | None:
+def _parse_cd_filename(cd: str) -> Optional[str]:
+    """
+    Parse RFC 5987/6266 Content-Disposition:
+    - filename*=UTF-8''nombre.ext
+    - filename="nombre.ext"
+    """
     if not cd:
         return None
-    m = re.search(r"filename\*\s*=\s*[^']+''([^;]+)", cd, flags=re.I)
+    # filename*=
+    m = re.search(r"filename\*\s*=\s*([^']*)''([^;]+)", cd, re.IGNORECASE)
     if m:
-        return unquote(m.group(1))
-    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, flags=re.I)
-    if m:
-        return m.group(1)
-    m = re.search(r'filename\s*=\s*([^;]+)', cd, flags=re.I)
+        # charset = m.group(1) (no usamos, asumimos UTF-8)
+        fn = requests.utils.unquote(m.group(2))
+        return fn.strip().strip('"')
+    # filename=
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.IGNORECASE)
     if m:
         return m.group(1).strip()
+    m = re.search(r"filename\s*=\s*([^;]+)", cd, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().strip('"')
     return None
 
-def _candidate_from_query(url: str) -> str | None:
-    q = parse_qs(urlparse(url).query)
-    for key in ("filename", "fileName", "name", "title", "attachment", "attname"):
-        if key in q and q[key]:
-            return q[key][0]
-    return None
-
-def _derive_name(url: str, headers: Dict[str, str]) -> str:
-    cd = headers.get("content-disposition") or headers.get("Content-Disposition")
-    name = _filename_from_content_disposition(cd)
-
-    if not name:
-        name = _candidate_from_query(url)
-
-    if not name:
-        path_last = urlparse(url).path.rstrip("/").split("/")[-1] or "file"
-        name = unquote(path_last)
-
-    name = _sanitize_filename(name)
-
-    # añade extensión si falta
-    has_ext = "." in Path(name).name and len(Path(name).suffix) > 1
-    if not has_ext:
-        ext = _ext_from_content_type(headers.get("content-type") or headers.get("Content-Type"))
-        name = f"{name}{ext}"
+def _last_segment_name(u: str) -> str:
+    """Último segmento de la URL sin query; si vacío, 'file.mp4'."""
+    name = u.split("?")[0].rstrip("/").split("/")[-1] or "file"
+    if "." not in name:
+        name += ".mp4"
     return name
 
+def _name_from_query_filename(u: str) -> Optional[str]:
+    """Si la URL trae ?filename=... úsalo (tu caso con Drive v3)."""
+    try:
+        q = parse_qs(urlparse(u).query)
+        vals = q.get("filename")
+        if vals and vals[0]:
+            return vals[0]
+    except Exception:
+        pass
+    return None
+
 def _dedup_path(p: Path) -> Path:
+    """Si p existe, devuelve p con sufijos _2, _3, ..."""
     if not p.exists():
         return p
-    stem, suf = p.stem, p.suffix
+    stem = p.stem
+    suf = p.suffix
     i = 2
     while True:
         cand = p.with_name(f"{stem}_{i}{suf}")
@@ -117,20 +127,103 @@ def _dedup_path(p: Path) -> Path:
             return cand
         i += 1
 
-# -------------------- descarga --------------------
+# -------------------- Google Drive helpers (opcionales) --------------------
+def _extract_drive_folder_id(folder_url: str) -> str | None:
+    try:
+        p = urlparse(folder_url)
+        if p.netloc not in ("drive.google.com", "www.drive.google.com"):
+            return None
+        parts = [x for x in p.path.split("/") if x]
+        for i, seg in enumerate(parts):
+            if seg == "folders" and i + 1 < len(parts):
+                folder_id = parts[i + 1]
+                return folder_id.split("?")[0]
+    except Exception:
+        return None
+    return None
+
+def _gdrive_client():
+    from googleapiclient.discovery import build
+    from google.oauth2 import service_account
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if not creds_path or not os.path.exists(creds_path):
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS no configurado o inexistente.")
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def _gdrive_bearer_headers() -> Dict[str, str]:
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not creds_path or not os.path.exists(creds_path):
+            return {}
+        scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+        creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
+        creds.refresh(Request())
+        return {"Authorization": f"Bearer {creds.token}"}
+    except Exception:
+        return {}
+
+# -------------------- descarga (con nombre correcto) --------------------
 def download_many(urls: List[str], dest_dir: Path) -> List[Path]:
+    """
+    Baja todas las URLs a dest_dir.
+    Regla de nombre:
+      1) Content-Disposition (filename* / filename)
+      2) ?filename= de la URL (ya soporta Drive API v3)
+      3) último segmento de la URL (fallback; evita 'uc' si el header venía)
+    Se sanitiza y se asegura extensión por Content-Type si falta.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     out: List[Path] = []
+
+    drive_headers_cache: Dict[str, str] | None = None
+
     for u in urls:
-        with requests.get(u, stream=True, timeout=60) as r:
+        headers: Dict[str, str] = {}
+        if "www.googleapis.com/drive/v3/files/" in u and "alt=media" in u:
+            if drive_headers_cache is None:
+                drive_headers_cache = _gdrive_bearer_headers()
+            headers = drive_headers_cache or {}
+
+        # GET (abrimos primero para leer headers)
+        with requests.get(
+            u,
+            stream=True,
+            timeout=(10, None),          # connect 10s, read stream sin límite
+            headers=headers,
+            allow_redirects=True,
+        ) as r:
             r.raise_for_status()
-            name = _derive_name(u, r.headers)
+
+            # 1) Intentar Content-Disposition
+            cd = r.headers.get("Content-Disposition") or r.headers.get("content-disposition")
+            name = _parse_cd_filename(cd) if cd else None
+
+            # 2) Intentar query ?filename=
+            if not name:
+                name = _name_from_query_filename(u)
+
+            # 3) Fallback: último segmento de la URL
+            if not name:
+                name = _last_segment_name(u)
+
+            # Sanitizar e intentar asegurar extensión por content-type
+            content_type = r.headers.get("Content-Type")
+            name = _sanitize_filename(name)
+            name = _ensure_extension(name, content_type)
+
             out_path = _dedup_path(dest_dir / name)
+
             with open(out_path, "wb") as f:
                 for chunk in r.iter_content(1024 * 256):
                     if chunk:
                         f.write(chunk)
-        out.append(out_path)
+
+            out.append(out_path)
+
     return out
 
 # -------------------- ffmpeg resize puro --------------------
@@ -155,7 +248,7 @@ def _zip_dir(src_dir: Path, zip_path: Path) -> None:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for p in src_dir.rglob("*"):
             if p.is_file():
-                z.write(p, p.relative_to(src_dir))
+                z.write(p, arcname=p.name)  # solo el nombre limpio
 
 # -------------------- worker --------------------
 def _process_job(job_id: str):
@@ -199,7 +292,7 @@ def _process_job(job_id: str):
 
         for f in files:
             job["current_file"] = f.name
-            stem = f.stem  # ya único por download_many
+            stem = f.stem  # único por download_many
             for r in ratios:
                 job["current_ratio"] = r
                 subdir = (output_dir / r) if group_by_ratio else output_dir
@@ -208,7 +301,7 @@ def _process_job(job_id: str):
                     if yolo_reframe is None:
                         raise RuntimeError("YOLO no disponible (import failed).")
                     W, H = targets.get(r, (1080, 1920))
-                    out_name = f"{stem}_tracked_{r}.mp4"  # <-- sufijo explícito
+                    out_name = f"{stem}_TRACKED_{r}.mp4"
                     out_path = subdir / out_name
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     yolo_reframe(
@@ -218,7 +311,8 @@ def _process_job(job_id: str):
                         override=None, model_name=yolo_model, conf=float(yolo_conf)
                     )
                 else:
-                    out_name = f"{stem}_{r}.mp4" if codec == "h264" else f"{stem}_{r}.mov"
+                    ext = "mp4" if codec == "h264" else "mov"
+                    out_name = f"{stem}_RESIZE_{r}.{ext}"
                     out_path = subdir / out_name
                     cmd = _ffmpeg_cmd(f, out_path, r, codec)
                     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -297,3 +391,59 @@ def cancel_job(job_id: str):
         raise HTTPException(404, "Job no encontrado")
     job.update(dict(phase="canceled", message="Cancelado por el usuario.", progress=100))
     return {"ok": True}
+
+# --------- Expand Google Drive Folder (opcional) ----------
+@app.post("/expand/google_drive_folder")
+def expand_google_drive_folder(req: Dict[str, Any]):
+    if not os.environ.get("GDRIVE_ENABLE"):
+        raise HTTPException(501, "Google Drive expansion no está habilitado en este servidor.")
+
+    folder_url = (req.get("folder_url") or "").strip()
+    if not folder_url:
+        raise HTTPException(400, "Falta folder_url.")
+
+    folder_id = _extract_drive_folder_id(folder_url)
+    if not folder_id:
+        raise HTTPException(400, "folder_url inválida (no encuentro folder ID).")
+
+    try:
+        drive = _gdrive_client()
+        q = f"'{folder_id}' in parents and trashed = false and mimeType contains 'video/'"
+        page_token = None
+        files = []
+        while True:
+            resp = drive.files().list(
+                q=q,
+                fields="nextPageToken, files(id, name, mimeType, size)",
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            for f in resp.get("files", []):
+                fid = f["id"]
+                dl = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+                dl_with_name = f"{dl}&filename={f.get('name', 'video.mp4')}"
+                files.append({
+                    "id": fid,
+                    "name": f.get("name"),
+                    "size": int(f.get("size", 0)) if "size" in f else None,
+                    "mimeType": f.get("mimeType"),
+                    "downloadUrl": dl_with_name,
+                })
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        return {"files": files, "count": len(files), "folder_id": folder_id}
+
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(500, f"Error de configuración: {e}")
+    except Exception as e:
+        error_msg = str(e)
+        if "403" in error_msg or "Forbidden" in error_msg:
+            raise HTTPException(403, f"Sin permisos para acceder a la carpeta {folder_id}. Verifica que la carpeta sea pública o que las credenciales tengan acceso.")
+        elif "404" in error_msg or "Not Found" in error_msg:
+            raise HTTPException(404, f"Carpeta {folder_id} no encontrada. Verifica que el ID sea correcto y que la carpeta exista.")
+        else:
+            raise HTTPException(500, f"Error consultando Drive: {error_msg}")

@@ -2,12 +2,18 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile.full   # 👈 acá le decís que use el Dockerfile.full
+      dockerfile: Dockerfile.full
     container_name: videoresizer-api
     ports:
       - "8000:8000"
+    environment:
+      # Activa la feature de Google Drive
+      - GDRIVE_ENABLE=1
+      # Ruta DENTRO del contenedor al JSON del Service Account
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/sa.json
     volumes:
-      - ./runs:/app/runs
+      # Monta tu archivo local api/sa.json dentro del contenedor en /app/sa.json (solo lectura)
+      - ./api/sa.json:/app/sa.json:ro
     restart: unless-stopped
 
   web:
@@ -15,8 +21,11 @@ services:
       context: ./web
       dockerfile: Dockerfile
     container_name: videoresizer-web
-    ports:
-      - "3000:3000"
     depends_on:
       - api
+    environment:
+      # El front hablará con el contenedor "api" en la red interna
+      - NEXT_PUBLIC_API_BASE=http://api:8000
+    ports:
+      - "3000:3000"
     restart: unless-stopped

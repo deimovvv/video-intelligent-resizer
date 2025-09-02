@@ -14,7 +14,11 @@ web/.turbo/
 web/.cache/
 web/.DS_Store
 
-# --- Datos/artefactos
+# --- Docker (artefactos locales)
+*.tar
+**/.dockerignore.swp
+
+# --- Datos/artefactos de la app
 runs/
 input/
 output/
@@ -24,6 +28,16 @@ output/
 *.mkv
 *.avi
 *.m4v
+
+# --- Credenciales / secretos (¡no subir!)
+api/sa.json
+*.env
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.crt
 
 # --- OS
 .DS_Store
